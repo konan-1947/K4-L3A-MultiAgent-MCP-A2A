@@ -1,53 +1,57 @@
-# L3A Architecture Record
+# Tài liệu kiến trúc L3A
 
-Team phải cập nhật tài liệu này cùng source. Mục tiêu là mô tả quyết định có thể kiểm chứng, không ghi prompt bí mật hoặc chain-of-thought.
+## 1. Tổng quan hệ thống
 
-## 1. System overview
-
-Vẽ hoặc mô tả luồng từ `inputs/<case_id>.json` đến MCP calls, specialist agents, verifier, output và trace.
+Workflow nhận một case, phân công các specialist thu thập evidence từ MCP theo chủ đề claim, xác minh phạm vi/domain, rồi tạo output và trace. Nếu tool lỗi hoặc chưa đủ dữ liệu để kết luận, case được giữ ở trạng thái cần điều tra; workflow không suy đoán từ lời khách hàng.
 
 ```text
-Input → Coordinator → Specialists → Verifier → Output
-                         │              │
-                         └── MCP ───────┴── Trace
+Input -> Coordinator -> Order / Item / Payment / Shipment / Seller / Policy agents
+                |                         |                  |
+                +---------------------- MCP ----------------+
+                +-> Verifier -> Output
+                +--------------> Trace
 ```
 
-## 2. Agent ownership
+## 2. Phân công vai trò agent
 
-| Actor | Input | Trách nhiệm | Output/handoff |
+| Actor | Trách nhiệm | Tool được dùng |
+| --- | --- | --- |
+| Coordinator | Kiểm tra case, chọn các tool cần tra cứu theo topic claim và giao việc | Discovery MCP |
+| Order agent | Xác minh đơn hàng | `get_order` |
+| Item agent | Xác minh item và ngữ cảnh sản phẩm | `get_order_items`, `get_product_context` |
+| Payment agent | Xác minh payment và refund lifecycle | `get_order_payments`, `get_payment_timeline`, `get_refund_timeline` |
+| Shipment agent | Xác minh các mốc và sự kiện giao hàng | `get_shipment_summary` |
+| Seller agent | Xác minh seller liên quan đến item trong đơn | `get_sellers` |
+| Policy agent | Lấy policy đúng phiên bản; không khuyến nghị refund nếu chưa xác minh eligibility | `get_policy` |
+| Verifier | Kiểm tra domain, phạm vi case/order, evidence coverage và contract | Không gọi tool |
+
+Tool được chọn theo `topic` của claim. Các claim không nhận diện được vẫn được chuyển verifier ở trạng thái chưa đủ evidence; workflow không đoán tool.
+
+## 3. Giao thức A2A
+
+Workflow hiện chạy tuần tự trong cùng tiến trình; chưa triển khai giao thức A2A qua mạng. Các lần bàn giao quan sát được thể hiện bằng sự kiện giao việc trong trace và được liên kết bằng `case_id`.
+
+## 4. Vòng đời evidence
+
+Mỗi MCP call truyền `case_id` của case hiện tại; các tool liên quan đơn hàng cũng nhận mã đơn khách hàng khai báo. Gateway xác thực response contract. Workflow kiểm tra domain mong đợi và, với order data nếu response có mã đơn, kiểm tra mã đó khớp. `evidence_ref` do server cấp được giữ nguyên, ghi vào trace và output; evidence không được chia sẻ giữa các case.
+
+## 5. Chính sách xử lý lỗi
+
+| Lỗi | Thử lại | Phương án dự phòng | Cách xử lý |
 | --- | --- | --- | --- |
-| Coordinator | TODO | TODO | TODO |
-| Order/item | TODO | TODO | TODO |
-| Payment | TODO | TODO | TODO |
-| Shipment | TODO | TODO | TODO |
-| Policy | TODO | TODO | TODO |
-| Verifier | TODO | TODO | TODO |
+| MCP timeout hoặc tool báo lỗi | Không tự động thử lại | Không có | Ghi handoff lỗi, tiếp tục các tool độc lập còn lại và giữ case cần điều tra |
+| Thiếu mã đơn khách hàng khai báo | Không | Không có | Dừng case với lỗi xác thực |
+| Evidence sai domain hoặc mã đơn | Không | Không có | Từ chối evidence và giữ case cần điều tra |
+| Thiếu evidence hoặc chưa xác minh được semantics | Không áp dụng | Không suy đoán | Claim `insufficient_evidence`; không đề xuất refund |
 
-Nêu rõ actor nào được quyền gọi tool nào. Tránh cho mọi agent quyền truy vấn tất cả tool nếu không cần thiết.
+## 6. Các điều kiện bắt buộc khi xác minh
 
-## 3. A2A protocol
+- Mọi output và trace event đều được kiểm tra theo JSON schema tương ứng.
+- Giá trị `evidence_ref` do MCP trả về được giữ nguyên, không trùng lặp trong danh sách tham chiếu và chỉ gắn với case tương ứng.
+- Không dùng evidence đơn hàng để tự suy ra sự kiện thanh toán, vận chuyển, trách nhiệm hoặc quyền hoàn tiền.
+- Không đề xuất số tiền hoàn hoặc hành động xử lý nếu thiếu evidence hỗ trợ.
+- Bộ phân loại semantics/root cause/refund chưa hoàn thiện; đến khi response MCP thực tế được xác minh, kết luận được giữ ở trạng thái `needs_investigation`.
 
-Mô tả message envelope, correlation theo `case_id`, điều kiện handoff, timeout và cách tránh vòng lặp. Chỉ trace sự kiện/decision code quan sát được; không trace nội dung suy luận riêng.
+## 7. Khả năng tái lập
 
-## 4. Evidence lifecycle
-
-Mô tả cách validate MCP response, lưu `evidence_ref`, map evidence vào claim/output và emit `tool_result_consumed`. Evidence không được tái sử dụng giữa các case.
-
-## 5. Failure policy
-
-| Failure | Retry? | Fallback | Trace event/code |
-| --- | --- | --- | --- |
-| MCP timeout | TODO | TODO | TODO |
-| Not found | TODO | TODO | TODO |
-| Source conflict | TODO | TODO | TODO |
-| Invalid specialist result | TODO | TODO | TODO |
-
-Retry phải có giới hạn và idempotent. Không chuyển missing evidence thành dữ liệu phỏng đoán.
-
-## 6. Verification invariants
-
-Liệt kê kiểm tra trước finalize: schema, entity scope, evidence ownership, claim linkage, money totals, responsibility/action consistency và confidence bounds.
-
-## 7. Reproducibility
-
-Ghi model/config, dependency pinning, concurrency limit, random seed (nếu có), lệnh chạy và các giới hạn tài nguyên. Không ghi API key.
+Chạy `day09 mcp-tools`, `day09 run` và `day09 validate` từ thư mục gốc repo sau khi cấu hình `.env`. `day09 mcp-tools` hiển thị tên, mô tả và schema tham số của các tool. Không ghi Team API Key vào trace hoặc tài liệu kiến trúc.
