@@ -9,7 +9,7 @@ from pathlib import Path
 from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
-from .mcp_gateway import connect_gateway
+from .mcp_gateway import EvidenceGateway, connect_gateway
 from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
 from .workflow import solve_case
@@ -40,13 +40,15 @@ async def _run(root: Path) -> None:
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+    received_cases: set[str] = set()
+
+    async def process_case(case_id: str, gateway: EvidenceGateway) -> None:
+        case = case_set.cases[case_id]
+        checkpoint = trace.path.stat().st_size if trace.path.exists() else 0
+        try:
+            if case_id not in received_cases:
+                trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+                received_cases.add(case_id)
             output = await solve_case(case, gateway, trace)
             contracts.validate_output(output, f"outputs/{case_id}.json")
             if output.get("case_id") != case_id:
@@ -58,6 +60,41 @@ async def _run(root: Path) -> None:
             )
             temporary.replace(target)
             trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+        except BaseException:
+            # A stream disconnect can happen after several tool results. Those
+            # partial events belong to a failed attempt and must not remain in
+            # the final trace when the case is re-run on a new session.
+            with trace.path.open("r+b") as handle:
+                handle.truncate(checkpoint)
+            received_cases.discard(case_id)
+            raise
+
+    # Short sessions limit the blast radius of streamable-HTTP disconnects;
+    # a failed case is replayed on a fresh session with its partial trace
+    # rolled back by process_case().
+    batch_size = 5
+    discovered = False
+    for start in range(0, len(case_set.case_ids), batch_size):
+        pending = list(case_set.case_ids[start : start + batch_size])
+        for attempt in range(5):
+            if not pending:
+                break
+            try:
+                async with connect_gateway(
+                    settings.mcp_endpoint, settings.team_api_key, contracts
+                ) as gateway:
+                    if not discovered:
+                        discovered_tools = await gateway.list_tools()
+                        if not discovered_tools:
+                            raise RuntimeError("MCP Gateway returned no tools")
+                        discovered = True
+                    for case_id in pending.copy():
+                        await process_case(case_id, gateway)
+                        pending.remove(case_id)
+            except Exception:
+                if attempt == 4:
+                    raise
+                await asyncio.sleep(1)
 
 
 def parser() -> argparse.ArgumentParser:
